@@ -10,7 +10,6 @@ FROM python:3.11-slim AS builder
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     POETRY_VERSION=1.8.3 \
-    POETRY_VIRTUALENVS_CREATE=false \
     VENV_PATH=/opt/venv
 
 # Build-time only: compilers/headers for any sdist that lacks a wheel.
@@ -18,12 +17,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Create the runtime virtualenv up front so every install lands in it.
-RUN python -m venv "$VENV_PATH"
-ENV PATH="$VENV_PATH/bin:$PATH"
+# Poetry lives in the BASE interpreter (not the runtime venv), and is only used
+# to translate the lock file into a pinned requirements list.
+RUN pip install "poetry==${POETRY_VERSION}" "poetry-plugin-export==1.8.0"
 
-# Install Poetry into its own location (kept out of the runtime venv).
-RUN pip install "poetry==${POETRY_VERSION}"
+# Create the runtime virtualenv that will be copied into the final image.
+RUN python -m venv "$VENV_PATH"
 
 WORKDIR /app
 
@@ -31,14 +30,15 @@ WORKDIR /app
 # changes. poetry.lock pins the exact, known-good dependency set.
 COPY pyproject.toml poetry.lock ./
 
-# Install ONLY the main dependency group (no dev tools) into the active venv
-# using the lock file for reproducibility. pyproject has package-mode=false, so
-# only dependencies are installed (there is no project root to build).
-RUN poetry install --only main --no-interaction --no-ansi
+# Export the locked main dependencies, then install them EXPLICITLY into the
+# venv's own pip. This avoids any ambiguity about where Poetry would install
+# (the previous `poetry install` left the venv empty, producing a tiny image
+# with no streamlit). poetry.lock keeps the versions reproducible.
+RUN poetry export --only main --without-hashes --format requirements.txt --output requirements.txt \
+    && "$VENV_PATH/bin/pip" install --no-cache-dir -r requirements.txt
 
-# Drop bytecode/caches that pip/poetry leave behind to trim the venv.
-RUN find "$VENV_PATH" -type d -name "__pycache__" -prune -exec rm -rf {} + \
-    && find "$VENV_PATH" -type d -name "tests" -prune -exec rm -rf {} + 2>/dev/null || true
+# Drop bytecode/caches to trim the venv.
+RUN find "$VENV_PATH" -type d -name "__pycache__" -prune -exec rm -rf {} + 2>/dev/null || true
 
 ###############################################################################
 # Runtime stage: slim Python + the prebuilt venv only. No conda, no gcloud SDK.
