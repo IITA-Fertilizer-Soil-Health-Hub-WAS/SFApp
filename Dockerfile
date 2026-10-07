@@ -1,69 +1,88 @@
-# First stage: Base setup with Miniconda and required installations
-FROM python:3.9-slim as base
+# syntax=docker/dockerfile:1
 
-# Update package lists and install necessary packages
-RUN apt-get update && \
-    apt-get install -y wget curl gnupg && \
-    rm -rf /var/lib/apt/lists/*
+###############################################################################
+# Builder stage: resolve the locked dependencies into a self-contained venv.
+# Nothing from this stage ships except the finished /opt/venv, so build tools
+# and caches never bloat the runtime image.
+###############################################################################
+FROM python:3.11-slim AS builder
 
-# Set environment variables for Miniconda
-ENV PATH="/root/miniconda3/bin:${PATH}"
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    POETRY_VERSION=1.8.3 \
+    POETRY_VIRTUALENVS_CREATE=false \
+    VENV_PATH=/opt/venv
 
-# Install Miniconda
-RUN wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh && \
-    mkdir /root/.conda && \
-    bash Miniconda3-latest-Linux-x86_64.sh -b && \
-    rm -f Miniconda3-latest-Linux-x86_64.sh
+# Build-time only: compilers/headers for any sdist that lacks a wheel.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install Earth Engine API and create a conda environment
-RUN conda install -y -c conda-forge earthengine-api && \
-    conda create --name gee python
+# Create the runtime virtualenv up front so every install lands in it.
+RUN python -m venv "$VENV_PATH"
+ENV PATH="$VENV_PATH/bin:$PATH"
 
-# Install Mamba and Geemap
-RUN conda install -y -c conda-forge mamba  && \
-    mamba install -y -c conda-forge geemap
+# Install Poetry into its own location (kept out of the runtime venv).
+RUN pip install "poetry==${POETRY_VERSION}"
 
-# Install Python dependencies
-RUN pip3 install streamlit geojson geopandas datetime shapely matplotlib plotly python-dotenv
+WORKDIR /app
 
-# Second stage: Final image with only the necessary components
-FROM python:3.9-slim
+# Copy only the dependency manifests first so this layer caches across code
+# changes. poetry.lock pins the exact, known-good dependency set.
+COPY pyproject.toml poetry.lock ./
 
-# Copy Miniconda from the base stage
-COPY --from=base /root/miniconda3 /root/miniconda3
-COPY --from=base /root/.conda /root/.conda
+# Install ONLY the main dependency group (no dev tools) into the active venv
+# using the lock file for reproducibility. pyproject has package-mode=false, so
+# only dependencies are installed (there is no project root to build).
+RUN poetry install --only main --no-interaction --no-ansi
 
-# Set environment variables for Miniconda
-ENV PATH="/root/miniconda3/bin:${PATH}"
+# Drop bytecode/caches that pip/poetry leave behind to trim the venv.
+RUN find "$VENV_PATH" -type d -name "__pycache__" -prune -exec rm -rf {} + \
+    && find "$VENV_PATH" -type d -name "tests" -prune -exec rm -rf {} + 2>/dev/null || true
 
-# Install necessary packages for Google Cloud SDK
-RUN apt-get update && \
-    apt-get install -y wget curl gnupg && \
-    rm -rf /var/lib/apt/lists/*
+###############################################################################
+# Runtime stage: slim Python + the prebuilt venv only. No conda, no gcloud SDK.
+# The geo wheels (shapely/pyproj/fiona/geopandas) bundle their native libraries,
+# so the slim base needs no extra system packages.
+###############################################################################
+FROM python:3.11-slim AS runtime
 
-# Install Google Cloud SDK
-RUN echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" \
-    | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list && \
-    curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key --keyring /usr/share/keyrings/cloud.google.gpg add - && \
-    apt-get update && \
-    apt-get install -y google-cloud-sdk
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    VENV_PATH=/opt/venv \
+    PATH="/opt/venv/bin:$PATH" \
+    # Non-interactive Earth Engine auth (service account) by default in the
+    # container; override to "interactive" only for local dev.
+    AUTH_MECHANISM=service_account \
+    # The entrypoint writes the service-account key here from a secret env var.
+    GOOGLE_APPLICATION_CREDENTIALS=/var/secrets/google/key.json \
+    # Streamlit listens here; the Container App targetPort must match.
+    PORT=8501
 
-# Set environment variables for Google Cloud SDK
-ENV PATH="/usr/lib/google-cloud-sdk/bin:${PATH}"
+# curl is only needed for the container healthcheck.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 appuser \
+    && mkdir -p /var/secrets/google \
+    && chown -R appuser:appuser /var/secrets/google
 
-# Set the Google Application Credentials environment variable
-ENV GOOGLE_APPLICATION_CREDENTIALS="/var/secrets/google/sampling-frames-iita-a80b3e765388.json"
+# Bring in the finished virtualenv from the builder.
+COPY --from=builder /opt/venv /opt/venv
 
-
-# Copy the working directory contents from the base stage
 WORKDIR /SFApp
-COPY . .
 
-# Expose Streamlit default port
+# Application code (see .dockerignore for what stays out of the image).
+COPY --chown=appuser:appuser . .
+
+RUN chmod +x /SFApp/docker-entrypoint.sh
+
+USER appuser
+
 EXPOSE 8501
 
-# Healthcheck
-HEALTHCHECK CMD curl --fail http://localhost:8501/_stcore/health || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+    CMD curl --fail "http://localhost:${PORT}/_stcore/health" || exit 1
 
-# Specify the entry point
-ENTRYPOINT ["streamlit", "run", "SFapp.py", "--server.port=8501"]
+ENTRYPOINT ["/SFApp/docker-entrypoint.sh"]

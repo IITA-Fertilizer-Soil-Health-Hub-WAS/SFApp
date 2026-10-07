@@ -1,0 +1,151 @@
+name: Deploy to Azure Container Apps
+
+# Builds the image with Docker on the runner, pushes to ACR, and deploys the
+# Streamlit app to Azure Container Apps. Auth to Azure uses GitHub OIDC (no
+# stored cloud passwords); the Container App pulls from ACR using the
+# user-assigned managed identity in ACR_PULL_IDENTITY_ID. Matches the pattern
+# used by the data-infrastructure deploy.
+#
+# Configuration comes from repo VARIABLES and SECRETS (Settings -> Secrets and
+# variables -> Actions), so this file needs no editing between environments.
+#   Variables: ACR_NAME, ACR_LOGIN_SERVER, AZURE_RESOURCE_GROUP,
+#              CONTAINERAPP_NAME, CONTAINERAPP_ENV, ACR_PULL_IDENTITY_ID,
+#              AZURE_LOCATION (only used if the environment must be created),
+#              SERVICE_ACCOUNT (optional; Earth Engine service-account email)
+#   Secrets:   AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID,
+#              GOOGLE_CREDENTIALS_JSON (Earth Engine service-account key JSON)
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'azure/azuredeploy.json']
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write      # for azure/login via OIDC
+  contents: read
+
+concurrency:
+  group: deploy-azure-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ${{ vars.ACR_LOGIN_SERVER }}/sfapp:${{ github.sha }}
+  IMAGE_LATEST: ${{ vars.ACR_LOGIN_SERVER }}/sfapp:latest
+  TARGET_PORT: '8501'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Build locally with Docker on the runner, then push to ACR. `az acr login`
+      # uses the OIDC identity (needs AcrPush on the registry); ubuntu-latest is
+      # linux/amd64 so the image is native.
+      - name: Build & push image (Docker)
+        run: |
+          az acr login --name "${{ vars.ACR_NAME }}"
+          docker build -t "$IMAGE" -t "$IMAGE_LATEST" .
+          docker push "$IMAGE"
+          docker push "$IMAGE_LATEST"
+
+      - name: Ensure Container Apps CLI extension
+        run: |
+          az config set extension.use_dynamic_install=yes_without_prompt
+          az extension add --name containerapp --upgrade --only-show-errors
+
+      - name: Deploy to Container Apps
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+          APP: ${{ vars.CONTAINERAPP_NAME }}
+          ENVIRONMENT: ${{ vars.CONTAINERAPP_ENV }}
+          ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+          ACR_PULL_IDENTITY_ID: ${{ vars.ACR_PULL_IDENTITY_ID }}
+          LOCATION: ${{ vars.AZURE_LOCATION }}
+          SERVICE_ACCOUNT: ${{ vars.SERVICE_ACCOUNT || 'sampling-frames@valued-proton-426311-r0.iam.gserviceaccount.com' }}
+          MIN_REPLICAS: ${{ vars.MIN_REPLICAS || '1' }}
+          MAX_REPLICAS: ${{ vars.MAX_REPLICAS || '3' }}
+          CPU: ${{ vars.ACA_CPU || '1.0' }}
+          MEMORY: ${{ vars.ACA_MEMORY || '2.0Gi' }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GOOGLE_CREDENTIALS_JSON:-}" ]; then
+            echo "::error::GOOGLE_CREDENTIALS_JSON secret is empty. The app needs the" \
+                 "Earth Engine service-account key JSON to initialize."
+            exit 1
+          fi
+          if [ -z "${ACR_PULL_IDENTITY_ID:-}" ]; then
+            echo "::error::ACR_PULL_IDENTITY_ID variable is empty. Set it to the resource" \
+                 "id of the user-assigned managed identity that has AcrPull on the registry."
+            exit 1
+          fi
+
+          echo "Deploying image: $IMAGE"
+
+          # Create the managed environment if it doesn't exist yet.
+          if ! az containerapp env show -g "$RG" -n "$ENVIRONMENT" >/dev/null 2>&1; then
+            echo "Creating Container Apps environment '$ENVIRONMENT'..."
+            az containerapp env create \
+              -g "$RG" -n "$ENVIRONMENT" -l "${LOCATION:?set the AZURE_LOCATION variable to create the environment}" \
+              --only-show-errors
+          fi
+
+          if az containerapp show -g "$RG" -n "$APP" >/dev/null 2>&1; then
+            echo "Updating existing Container App '$APP'..."
+            # Ensure the pull identity is attached and used for the registry.
+            az containerapp identity assign \
+              -g "$RG" -n "$APP" --user-assigned "$ACR_PULL_IDENTITY_ID" \
+              --only-show-errors
+            az containerapp registry set \
+              -g "$RG" -n "$APP" \
+              --server "$ACR_LOGIN_SERVER" --identity "$ACR_PULL_IDENTITY_ID" \
+              --only-show-errors
+            az containerapp secret set \
+              -g "$RG" -n "$APP" \
+              --secrets google-credentials="$GOOGLE_CREDENTIALS_JSON" \
+              --only-show-errors
+            az containerapp update \
+              -g "$RG" -n "$APP" \
+              --image "$IMAGE" \
+              --min-replicas "$MIN_REPLICAS" --max-replicas "$MAX_REPLICAS" \
+              --set-env-vars \
+                AUTH_MECHANISM=service_account \
+                SERVICE_ACCOUNT="$SERVICE_ACCOUNT" \
+                GOOGLE_CREDENTIALS_JSON=secretref:google-credentials \
+              --only-show-errors
+          else
+            echo "Creating Container App '$APP'..."
+            az containerapp create \
+              -g "$RG" -n "$APP" \
+              --environment "$ENVIRONMENT" \
+              --image "$IMAGE" \
+              --user-assigned "$ACR_PULL_IDENTITY_ID" \
+              --registry-server "$ACR_LOGIN_SERVER" \
+              --registry-identity "$ACR_PULL_IDENTITY_ID" \
+              --target-port "$TARGET_PORT" \
+              --ingress external \
+              --min-replicas "$MIN_REPLICAS" --max-replicas "$MAX_REPLICAS" \
+              --cpu "$CPU" --memory "$MEMORY" \
+              --secrets google-credentials="$GOOGLE_CREDENTIALS_JSON" \
+              --env-vars \
+                AUTH_MECHANISM=service_account \
+                SERVICE_ACCOUNT="$SERVICE_ACCOUNT" \
+                GOOGLE_CREDENTIALS_JSON=secretref:google-credentials \
+              --only-show-errors
+          fi
+
+          FQDN=$(az containerapp show -g "$RG" -n "$APP" \
+            --query properties.configuration.ingress.fqdn -o tsv)
+          echo "### Deployed" >> "$GITHUB_STEP_SUMMARY"
+          echo "App URL: https://$FQDN" >> "$GITHUB_STEP_SUMMARY"
+          echo "Image:   $IMAGE" >> "$GITHUB_STEP_SUMMARY"
