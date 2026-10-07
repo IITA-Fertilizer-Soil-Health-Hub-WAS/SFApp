@@ -76,7 +76,11 @@ WORKDIR /SFApp
 # Application code (see .dockerignore for what stays out of the image).
 COPY --chown=appuser:appuser . .
 
-RUN chmod +x /SFApp/docker-entrypoint.sh
+# Make the working directory itself writable by appuser: geemap's
+# Map.to_streamlit() writes a temporary HTML file into the CWD at runtime, and
+# the directory node created by WORKDIR is otherwise owned by root.
+RUN chmod +x /SFApp/docker-entrypoint.sh \
+    && chown appuser:appuser /SFApp
 
 USER appuser
 
