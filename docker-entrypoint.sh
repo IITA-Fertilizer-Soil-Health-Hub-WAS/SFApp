@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # Container entrypoint for the Sampling Frames Streamlit app.
 #
-# The app (eefun.py) authenticates to Google Earth Engine at import time using a
-# service-account key *file*. In Azure Container Apps we don't mount files, so
-# the key is delivered as a Container App secret exposed to the container as the
-# GOOGLE_CREDENTIALS_JSON environment variable. This script materializes that
-# secret into the file path the app expects, then launches Streamlit.
+# 1. Materialize the Google Earth Engine service-account key from the
+#    GOOGLE_CREDENTIALS_JSON secret into the file path the app expects
+#    (eefun.py authenticates at import time using a key *file*).
+# 2. Start Streamlit on an internal port (127.0.0.1:8502).
+# 3. Run nginx in the foreground on the ingress port (8501) as a host-gate:
+#    only ALLOWED_HOST is served; every other Host (including the default
+#    *.azurecontainerapps.io FQDN) gets 404.
 set -euo pipefail
 
 CRED_PATH="${GOOGLE_APPLICATION_CREDENTIALS:-/var/secrets/google/key.json}"
-
 if [ -n "${GOOGLE_CREDENTIALS_JSON:-}" ]; then
     mkdir -p "$(dirname "$CRED_PATH")"
     printf '%s' "$GOOGLE_CREDENTIALS_JSON" > "$CRED_PATH"
@@ -20,8 +21,19 @@ elif [ "${AUTH_MECHANISM:-}" != "interactive" ] && [ ! -f "$CRED_PATH" ]; then
     echo "         secret). Earth Engine initialization will fail." >&2
 fi
 
-exec streamlit run SFapp.py \
-    --server.port="${PORT:-8501}" \
-    --server.address=0.0.0.0 \
+# Render the nginx host-gate config with the allowed public domain.
+ALLOWED_HOST="${ALLOWED_HOST:-samplingframes.akilimo.org}"
+mkdir -p /tmp/nginx
+sed "s/__ALLOWED_HOST__/${ALLOWED_HOST}/g" /SFApp/nginx.conf.template > /tmp/nginx/nginx.conf
+
+# Start Streamlit on the internal port; nginx (below) is the public entrypoint.
+streamlit run SFapp.py \
+    --server.port=8502 \
+    --server.address=127.0.0.1 \
     --server.headless=true \
-    --browser.gatherUsageStats=false
+    --server.enableCORS=false \
+    --server.enableXsrfProtection=false \
+    --browser.gatherUsageStats=false &
+
+# nginx in the foreground is the container's main process (PID 1 of the app).
+exec nginx -c /tmp/nginx/nginx.conf -g 'daemon off;'
