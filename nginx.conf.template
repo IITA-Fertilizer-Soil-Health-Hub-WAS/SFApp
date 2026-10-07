@@ -1,0 +1,66 @@
+# Host-gate in front of Streamlit.
+#
+# Only requests whose Host is the allowed public domain (__ALLOWED_HOST__) are
+# proxied to Streamlit. Every other Host — including the Azure Container Apps
+# default *.azurecontainerapps.io FQDN and direct IP hits — gets 404, so the app
+# is reachable ONLY at the custom domain. The platform health endpoint is
+# exempted so Container Apps probes still pass regardless of Host.
+#
+# Rendered at startup by docker-entrypoint.sh (it substitutes __ALLOWED_HOST__
+# and runs: nginx -c /tmp/nginx/nginx.conf -g 'daemon off;'). All writable paths
+# live under /tmp so nginx can run as the non-root appuser.
+
+worker_processes 1;
+pid /tmp/nginx/nginx.pid;
+error_log /dev/stderr warn;
+events { worker_connections 1024; }
+
+http {
+    access_log /dev/stdout;
+    client_body_temp_path /tmp/nginx/client;
+    proxy_temp_path       /tmp/nginx/proxy;
+    fastcgi_temp_path     /tmp/nginx/fastcgi;
+    uwsgi_temp_path       /tmp/nginx/uwsgi;
+    scgi_temp_path        /tmp/nginx/scgi;
+
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
+
+    upstream streamlit { server 127.0.0.1:8502; }
+
+    # Catch-all: the default FQDN, pod IP, or any other Host -> 404.
+    # Health endpoint is allowed so platform probes succeed on any Host.
+    server {
+        listen 8501 default_server;
+        server_name _;
+
+        location = /_stcore/health {
+            proxy_pass http://streamlit;
+        }
+        location / {
+            return 404;
+        }
+    }
+
+    # The only publicly served Host.
+    server {
+        listen 8501;
+        server_name __ALLOWED_HOST__;
+
+        location / {
+            proxy_pass http://streamlit;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_buffering off;
+            proxy_read_timeout 3600s;
+            proxy_send_timeout 3600s;
+        }
+    }
+}

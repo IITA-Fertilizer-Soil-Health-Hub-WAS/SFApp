@@ -88,6 +88,47 @@ from the key file.
 
 ---
 
+## Custom domain — serve only at `samplingframes.akilimo.org`
+
+The app is gated to a single public hostname. An in-container **nginx** sits in
+front of Streamlit (which listens internally on `127.0.0.1:8502`) and serves
+**only** the `ALLOWED_HOST` env var (default `samplingframes.akilimo.org`); every
+other Host — including the default `*.azurecontainerapps.io` FQDN and direct IP
+hits — gets **404**. The platform health path is exempted so probes still pass.
+To change the hostname, set the `ALLOWED_HOST` env var on the Container App (no
+rebuild needed).
+
+For the custom host to actually route, bind it on the Container App (one-time):
+
+```bash
+RG=data-infrastructure-rg
+APP=sfapp
+HOST=samplingframes.akilimo.org
+
+# 1) Verification id for the DNS TXT record
+az containerapp show -g "$RG" -n "$APP" --query properties.customDomainVerificationId -o tsv
+```
+
+At **akilimo.org DNS**, add:
+- `CNAME  samplingframes  →  sfapp.delightfulwater-14d0d55a.eastus.azurecontainerapps.io`
+- `TXT    asuid.samplingframes  →  <customDomainVerificationId from above>`
+
+Then issue a free managed certificate and bind the hostname:
+
+```bash
+ENV=<container-apps-environment-name>
+az containerapp hostname add  -g "$RG" -n "$APP" --hostname "$HOST"
+az containerapp hostname bind -g "$RG" -n "$APP" --hostname "$HOST" \
+  --environment "$ENV" --validation-method CNAME
+```
+
+After this, `https://samplingframes.akilimo.org` serves the app and the
+`azurecontainerapps.io` URL returns 404. (Azure Container Apps has no native
+switch to disable its default FQDN — the nginx host-gate is what enforces the
+404.)
+
+---
+
 ## Cold-start notes
 
 The image was slimmed from a Miniconda + mamba + Google Cloud SDK base (several
