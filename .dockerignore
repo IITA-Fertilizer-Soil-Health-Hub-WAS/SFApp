@@ -1,1 +1,31 @@
-secrets/midyear-button-379815-391083128e1a.json
+# Keep the build context (and image) small -> faster builds and cold starts.
+
+# Secrets must never enter the image (delivered at runtime via env/secret).
+secrets/
+*.json.key
+.env
+.env.*
+
+# Version control & CI
+.git
+.gitignore
+.github
+.pylintrc
+
+# Python caches / notebooks
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# Docs / infra not needed inside the runtime image
+README.md
+azure/
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# Unused duplicate asset at repo root (app uses assets/EiA_logo*.png)
+/EiA_logo.png
