@@ -57,19 +57,16 @@ ENV PYTHONUNBUFFERED=1 \
     AUTH_MECHANISM=service_account \
     # The entrypoint writes the service-account key here from a secret env var.
     GOOGLE_APPLICATION_CREDENTIALS=/var/secrets/google/key.json \
-    # nginx (the ingress port, targetPort must match) host-gates Streamlit, which
-    # listens internally on 8502. Only requests for ALLOWED_HOST are served; every
-    # other Host (incl. the default *.azurecontainerapps.io FQDN) gets 404.
-    PORT=8501 \
-    ALLOWED_HOST=samplingframes.akilimo.org
+    # Streamlit listens here; the Container App targetPort must match.
+    PORT=8501
 
-# nginx is the host-gate in front of Streamlit; curl is for the healthcheck.
+# curl is only needed for the container healthcheck.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl nginx-light \
+        curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 appuser \
-    && mkdir -p /var/secrets/google /tmp/nginx \
-    && chown -R appuser:appuser /var/secrets/google /tmp/nginx /var/log/nginx /var/lib/nginx
+    && mkdir -p /var/secrets/google \
+    && chown -R appuser:appuser /var/secrets/google
 
 # Bring in the finished virtualenv from the builder.
 COPY --from=builder /opt/venv /opt/venv
