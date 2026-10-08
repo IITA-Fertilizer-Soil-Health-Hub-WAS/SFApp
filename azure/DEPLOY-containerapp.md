@@ -88,17 +88,15 @@ from the key file.
 
 ---
 
-## Custom domain — serve only at `samplingframes.akilimo.org`
+## Custom domain — `samplingframes.akilimo.org`
 
-The app is gated to a single public hostname. An in-container **nginx** sits in
-front of Streamlit (which listens internally on `127.0.0.1:8502`) and serves
-**only** the `ALLOWED_HOST` env var (default `samplingframes.akilimo.org`); every
-other Host — including the default `*.azurecontainerapps.io` FQDN and direct IP
-hits — gets **404**. The platform health path is exempted so probes still pass.
-To change the hostname, set the `ALLOWED_HOST` env var on the Container App (no
-rebuild needed).
+Bind the hostname on the Container App so it serves the app over a free managed
+certificate. Note: the default `*.azurecontainerapps.io` FQDN keeps serving too
+— Azure Container Apps has no native switch to disable it. (An earlier nginx
+host-gate that 404'd the default FQDN was removed; if locking it down becomes a
+requirement, Azure Front Door with origin restriction is the clean route.)
 
-For the custom host to actually route, bind it on the Container App (one-time):
+One-time bind:
 
 ```bash
 RG=data-infrastructure-rg
@@ -109,8 +107,10 @@ HOST=samplingframes.akilimo.org
 az containerapp show -g "$RG" -n "$APP" --query properties.customDomainVerificationId -o tsv
 ```
 
-At **akilimo.org DNS**, add:
-- `CNAME  samplingframes  →  sfapp.delightfulwater-14d0d55a.eastus.azurecontainerapps.io`
+`akilimo.org` is served by **Cloudflare**, so add these in the **Cloudflare**
+dashboard (NOT an Azure DNS zone — that zone is not authoritative and Azure's
+validator won't see it):
+- `CNAME  samplingframes  →  sfapp.delightfulwater-14d0d55a.eastus.azurecontainerapps.io`, **Proxy status: DNS only (grey cloud)**
 - `TXT    asuid.samplingframes  →  <customDomainVerificationId from above>`
 
 Then issue a free managed certificate and bind the hostname:
@@ -122,10 +122,9 @@ az containerapp hostname bind -g "$RG" -n "$APP" --hostname "$HOST" \
   --environment "$ENV" --validation-method CNAME
 ```
 
-After this, `https://samplingframes.akilimo.org` serves the app and the
-`azurecontainerapps.io` URL returns 404. (Azure Container Apps has no native
-switch to disable its default FQDN — the nginx host-gate is what enforces the
-404.)
+After this, `https://samplingframes.akilimo.org` serves the app. Keep the
+Cloudflare record **grey-cloud** (Container Apps terminates TLS with its own
+managed cert; a Cloudflare proxy in front would clash).
 
 ---
 
